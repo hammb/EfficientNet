@@ -44,15 +44,19 @@ class CNNBlock(layers.Layer):
     ):
         super(CNNBlock, self).__init__()
         
-        self.cnn = layers.Conv2D(
-            filters = filters,
-            kernel_size = kernel_size,
-            strides = strides,
-            padding = padding,
-            use_bias = False,
-            kernel_initializer=CONV_KERNEL_INITIALIZER,
-            groups=groups,
-        )
+        self.cnn = keras.Sequential([
+            
+            layers.ZeroPadding2D(padding=(padding, padding)),
+            layers.Conv2D(
+                filters = filters,
+                kernel_size = kernel_size,
+                strides = strides,
+                use_bias = False,
+                kernel_initializer=CONV_KERNEL_INITIALIZER,
+                groups=groups,
+            )
+        ])
+         
         self.bn = layers.BatchNormalization()
         self.silu = layers.Activation('swish')
         
@@ -92,12 +96,12 @@ class SqueezeExcitation(layers.Layer):
         
         super(SqueezeExcitation, self).__init__()
         
-        self.se = keras.Sequential(
+        self.se = keras.Sequential([
             layers.GlobalAveragePooling2D(), # C x H x W -> C x 1 x 1
+            layers.Reshape((1, 1, filters)),
             layers.Conv2D(
                 filters = filters_reduced_dim, 
                 kernel_size = 1,
-                strides = 1,
                 padding = 'same',
                 kernel_initializer=CONV_KERNEL_INITIALIZER
             ),
@@ -105,31 +109,32 @@ class SqueezeExcitation(layers.Layer):
             layers.Conv2D(
                 filters = filters, 
                 kernel_size = 1,
-                strides = 1,
                 padding = 'same',
                 kernel_initializer=CONV_KERNEL_INITIALIZER
             ),
             layers.Activation('sigmoid')
-        )
+        ])
         
     def call(self, inputs):
-        return inputs * self.se(inputs)
+        return layers.multiply([inputs, self.se(inputs)])
         
 class InvertedResidualBlock(layers.Layer):
     def __init__(
             self, 
-            filters_in=32, 
-            filters_out=16,
-            kernel_size=3, 
-            strides=1, 
-            padding=1,
-            expand_ratio=1, 
+            filters_in, 
+            filters_out,
+            kernel_size, 
+            strides, 
+            padding,
+            expand_ratio, 
             reduction=4, # squeeze excitation (e.g 1/4)
             survial_prob=0.8, # stochastic depth
     ):
         super(InvertedResidualBlock, self).__init__()
         
         self.survial_prob = survial_prob
+        
+        self.training = False
         
         filters = filters_in * expand_ratio
         filters_reduced_dim = int(filters_in / reduction)
@@ -142,12 +147,20 @@ class InvertedResidualBlock(layers.Layer):
                 filters, kernel_size=3, strides=1, padding=padding
             )
         
-        self.conv = keras.Sequential(
-            CNNBlock(filters, kernel_size, strides, padding=padding,groups=filters),
+        if self.use_residual:
+            self.conv = keras.Sequential([
+            CNNBlock(filters, kernel_size, strides, padding=2,groups=filters),
             SqueezeExcitation(filters,filters_reduced_dim),
-            layers.Conv2D(filters_out, kernel_size=1, bias=False, kernel_initializer=CONV_KERNEL_INITIALIZER),
+            layers.Conv2D(filters_out, kernel_size=3, use_bias=False, kernel_initializer=CONV_KERNEL_INITIALIZER),
             layers.BatchNormalization()
-        )
+        ])
+        else:
+            self.conv = keras.Sequential([
+                CNNBlock(filters, kernel_size, strides, padding=padding,groups=filters),
+                SqueezeExcitation(filters,filters_reduced_dim),
+                layers.Conv2D(filters_out, kernel_size=1, use_bias=False, kernel_initializer=CONV_KERNEL_INITIALIZER),
+                layers.BatchNormalization()
+            ])
     def stochastic_depth(self, x):
         if not self.training:
             return x
@@ -159,7 +172,8 @@ class InvertedResidualBlock(layers.Layer):
         x = self.expand_conv(inputs) if self.expand else inputs
         
         if self.use_residual:
-            return self.stochastic_depth(self.conv(x)) + inputs
+            return self.conv(x) + inputs
+            #return self.stochastic_depth(self.conv(x)) + inputs
         else:
             return self.conv(x)
         
@@ -171,12 +185,12 @@ class EfficientNet(layers.Layer):
         last_channels = ceil(1280 * width_factor)
         self.pool = layers.GlobalAveragePooling2D()
         self.features = self.create_features(width_factor, depth_factor, last_channels)
-        self.classifier = keras.Sequential(
+        self.classifier = keras.Sequential([
             layers.Dropout(dropout_rate),
             layers.Flatten(),
             layers.Dense(last_channels),
             layers.Dense(num_classes, activation='softmax', kernel_initializer=DENSE_KERNEL_INITIALIZER)
-        )
+        ])
         
     def calculate_factors(self, version, alpha=1.2, beta=1.1):
         phi, res, drop_rate = phi_values[version]
@@ -188,11 +202,12 @@ class EfficientNet(layers.Layer):
     def create_features(self, width_factor, depth_factor, last_channels):
         filters = int(32 * width_factor)
         features = [
+            
             CNNBlock(
             filters, 
             kernel_size=3,
             strides=2,
-            padding='valid'
+            padding=1
             )
         ]
         filters_in = filters
@@ -220,22 +235,33 @@ class EfficientNet(layers.Layer):
             )
         )
         
-        return keras.Sequential(*features)
+        return keras.Sequential(features)
     
     def call(self, inputs):
-        x = self.pool(self.features(inputs))
-        return self.classifier(tf.reshape(x.shape[0],-1))
-    
-def test():
-    version = "b0"
-    phi, res, drop_rate = phi_values[version]
-    num_examples, num_classes = 4, 10
-    
-    model = EfficientNet(
-        version=version,
-        num_classes=num_classes,
-    )
-
+        
+        return keras.Sequential([
+            keras.Input(shape=inputs),
+            self.features, 
+            self.pool,
+            self.classifier
+        ],name="EfficientNet")
     
 
-test()
+version = "b0"
+phi, res, drop_rate = phi_values[version]
+num_classes = 10
+input_shape = (64, 64, 3)
+
+model = EfficientNet(version, num_classes)    
+
+model = model(input_shape)
+
+model.compile(
+        optimizer=keras.optimizers.Adam(lr=3e-4),
+        loss=keras.losses.CategoricalCrossentropy(from_logits=True),
+        metrics=['Accuracy']
+        )
+    
+model.summary()
+
+
